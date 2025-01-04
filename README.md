@@ -4,9 +4,13 @@
 
 This bare-bones custom Home Assistant (HA) component controls art mode on (newer) Samsung The Frame TVs. It is intended to be a proof of concept implementation until I can either contribute to the HA development or get traction for a similar feature request. It uses the `samsung-tv-ws-api` Python API, also used by the official `samsungtv` platform in HA. The Python API supports many more features than turning the art mode on and off, but since I could not get these to work, only the most basic switch feature was implemented.
 
+### Notice
+
+This integration uses the `art.py` functionality of `samsung-tv-ws-api`, which is not yet asynchronous. This means that this integration (and therefore also HA) will wait for a reply from the TV before continuing after a polling update. This means that it will degrade the performance of your HA instance once installed. Once the `art.py` functionality is provided in an asynchronous version (as many other parts of the API already is), I will update this repository accordingly.
+
 ### Installation
 
-The integration can be installed by copying the files to `/<config directory>/custom_components/frame_art`  and adding something similar to your `configuration.yaml`,
+The integration can be installed by copying all the files to `/<config directory>/custom_components/frame_art`  and adding something similar to your `configuration.yaml`,
 
 ```
 switch:
