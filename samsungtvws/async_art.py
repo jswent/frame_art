@@ -21,7 +21,7 @@ import uuid
 from . import exceptions, helper
 from .command import SamsungTVCommand
 from .async_connection import SamsungTVWSAsyncConnection
-from .remote import SamsungTVWS
+from .async_remote import SamsungTVWSAsyncRemote
 from .event import D2D_SERVICE_MESSAGE_EVENT, MS_CHANNEL_READY_EVENT
 from .async_rest import SamsungTVAsyncRest
 from .helper import get_ssl_context
@@ -52,11 +52,12 @@ class SamsungTVAsyncArt(SamsungTVWSAsyncConnection):
         host,
         token=None,
         token_file=None,
-        port=8001,
+        port=8002,
         timeout=None,
         key_press_delay=1,
-        name="SamsungTvRemote",
+        name="HASS",
     ):
+        _LOGGING.debug("Initializing SamsungTVAsyncArt")
         super().__init__(
             host,
             endpoint=ART_ENDPOINT,
@@ -73,13 +74,32 @@ class SamsungTVAsyncArt(SamsungTVWSAsyncConnection):
         self.session = None
         self.pending_requests = {}
         self.callbacks = {}
-        self.get_token()
+        # self.get_token()
+        # self.initialize()
+
+    async def initialize(self):
+        """Initialize the connection and token if needed"""
+        if not self.token:
+            self.token = await self.get_token()
+            _LOGGING.debug("Set token to %s", self.token)
+        else:
+            try:
+                await self.open()
+                _LOGGING.debug("Opened connection")
+                _LOGGING.debug("Closing connection")
+                await self.close()
+                _LOGGING.debug("Closed connection")
+            except Exception as e:
+                _LOGGING.debug('Unable to connect to %s - may be off?', self.host)
             
-    def get_token(self):
+    async def get_token(self):
         '''
         Open and close remote control websocket to get/check token
         '''
-        tv = SamsungTVWS(self.host, port=self.port, token=self.token, token_file=self.token_file, timeout=self.timeout)
+        remote = SamsungTVWSAsyncRemote(host=self.host, port=self.port, token_file=self.token_file)
+        await remote.open()
+        await remote.close()
+        return remote.token
 
     async def open(self):
         await super().open()
@@ -97,21 +117,54 @@ class SamsungTVAsyncArt(SamsungTVWSAsyncConnection):
 
         return self.connection
 
-    async def close(self):
-        if self.session:
-            await self.session.close()
-        await super().close()
+    async def close(self) -> None:
+        """Ensure proper cleanup of all resources."""
+        _LOGGING.debug("Closing connection")
+        try:
+            # Clean up pending requests
+            for request in self.pending_requests.values():
+                if not request.done():
+                    request.cancel()
+            self.pending_requests.clear()
+            
+            if self._recv_loop and not self._recv_loop.done():
+                self._recv_loop.cancel()
+                try:
+                    await self._recv_loop
+                except asyncio.CancelledError:
+                    pass
+            self._recv_loop = None
+            
+            await super().close()
+        except Exception as e:
+            _LOGGING.debug("Error during close: %s", str(e))
    
     async def start_listening(self) -> None:
-        # Override base class to process events
-        if not self.is_alive():
-            await self.open()
-        if await super().start_listening(self.process_event):
-            try:
-                await self.get_artmode()
-            except AssertionError:
-                pass
+        """Open, and start listening with proper initialization."""
+        _LOGGING.debug("Attempting to start listening")
+        try:
+            if self._recv_loop and not self._recv_loop.done():
+                _LOGGING.debug("Already listening")
+                return False
             
+            if not self.is_alive():
+                _LOGGING.debug("Connection not alive, opening connection")
+                await self.open()
+                await asyncio.sleep(0.5)
+            
+            if await super().start_listening(self.process_event):
+                _LOGGING.debug("Started listening")
+                try:
+                    await self.get_artmode()
+                except AssertionError:
+                    pass
+                return True
+            return False
+        except Exception as e:
+            _LOGGING.debug("Error in start_listening: %s", str(e))
+            await self.close()  # Ensure clean shutdown on error
+            raise
+
     def get_uuid(self):
         self.art_uuid = str(uuid.uuid4())
         return self.art_uuid
@@ -124,8 +177,14 @@ class SamsungTVAsyncArt(SamsungTVWSAsyncConnection):
             response = await asyncio.wait_for(self.pending_requests[request_uuid], timeout)
             data = json.loads(response["data"])
         except asyncio.exceptions.TimeoutError:
-            pass
-        self.pending_requests.pop(request_uuid, None)
+            _LOGGING.debug("Timeout waiting for response to request %s", request_uuid)
+            raise exceptions.ResponseError(f"Timeout waiting for response to request {request_uuid}")
+        except Exception as e:
+            _LOGGING.debug("Error waiting for response to request %s: %s", request_uuid, str(e))
+            raise
+        finally:
+            self.pending_requests.pop(request_uuid, None)
+
         if data and data.get("event", "*") == "error":
             raise exceptions.ResponseError(
                 f"{json.loads(data['request_data'])['request']} request failed "
@@ -137,16 +196,42 @@ class SamsungTVAsyncArt(SamsungTVWSAsyncConnection):
         self,
         request_data: Dict[str, Any],
         wait_for_event: Optional[str] = None,
-        timeout: int = 2
+        timeout: int = 2,
+        retry_count: int = 1
     ) -> Optional[Dict[str, Any]]:
+        """Send art request with connection check and retry logic."""
         if not request_data.get("id"):
-            request_data["id"] = self.get_uuid()            #old api
-        request_data["request_id"] = request_data["id"]     #new api
-        self.pending_requests[wait_for_event or request_data["id"]] = asyncio.Future()
-        await self.start_listening()
-        await self.send_command(ArtChannelEmitCommand.art_app_request(request_data))
-        return await self.wait_for_response(wait_for_event or request_data["id"], timeout)
+            request_data["id"] = self.get_uuid()
+        request_data["request_id"] = request_data["id"]
         
+        for attempt in range(retry_count + 1):
+            try:
+                # Check if connection is stale
+                if self._recv_loop and self._recv_loop.done():
+                    _LOGGING.debug("Listener loop completed, resetting connection")
+                    await self.close()
+                    self._recv_loop = None
+                
+                # Ensure we have an active listening connection
+                if not self._recv_loop or not self.is_alive():
+                    await self.start_listening()
+                
+                self.pending_requests[wait_for_event or request_data["id"]] = asyncio.Future()
+                await self.send_command(ArtChannelEmitCommand.art_app_request(request_data))
+                return await self.wait_for_response(wait_for_event or request_data["id"], timeout)
+                
+            except exceptions.ResponseError as e:
+                if attempt == retry_count:
+                    raise
+                _LOGGING.debug("Request failed, attempt %d: %s", attempt + 1, str(e))
+                await self.close()  # Force reconnection on next attempt
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                _LOGGING.debug("Unexpected error in _send_art_request: %s", str(e))
+                await self.close()
+                raise
+
     async def process_event(self, event=None, response=None):
         if event == D2D_SERVICE_MESSAGE_EVENT:
             data = json.loads(response["data"])
@@ -232,13 +317,12 @@ class SamsungTVAsyncArt(SamsungTVWSAsyncConnection):
         assert data
         return data
 
-    async def available(self, category=None, timeout=2):
+    async def available(self, category=None):
         '''
         category is 'MY-C0004' or 'MY-C0002' where 4 is favourites, 2 is my pictures, and 8 is store
         '''
         data = await self._send_art_request(
-            {"request": "get_content_list", "category": category},
-            timeout=timeout
+            {"request": "get_content_list", "category": category}
         )
         assert data
         return [ v for v in json.loads(data["content_list"]) if v['category_id'] == category] if category else json.loads(data["content_list"])
