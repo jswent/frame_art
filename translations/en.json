@@ -1,0 +1,30 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Samsung Frame",
+        "description": "Set up your Samsung Frame TV integration",
+        "data": {
+          "host": "IP Address",
+          "name": "Friendly Name",
+          "timeout": "Connection Timeout (seconds)"
+        }
+      }
+    },
+    "error": {
+      "invalid_host": "Invalid IP address or hostname",
+      "connection_failed": "Failed to connect to the TV"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Frame TV Options",
+        "description": "Configure Frame TV settings",
+        "data": {
+          "timeout": "Connection Timeout (seconds)"
+        }
+      }
+    }
+  }
+}
