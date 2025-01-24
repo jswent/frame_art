@@ -13,6 +13,7 @@ import logging
 from types import TracebackType
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
 
+import aiofiles
 from websockets.client import WebSocketClientProtocol, connect
 from websockets.exceptions import ConnectionClosed
 from websockets.protocol import State
@@ -23,7 +24,6 @@ from .event import (
     IGNORE_EVENTS_AT_STARTUP,
     MS_CHANNEL_CONNECT_EVENT,
     MS_CHANNEL_UNAUTHORIZED,
-    MS_CHANNEL_TIMEOUT
 )
 from .helper import get_ssl_context
 
@@ -46,11 +46,12 @@ class SamsungTVWSAsyncConnection(connection.SamsungTVWSBaseConnection):
         await self.close()
 
     async def open(self) -> WebSocketClientProtocol:
+        _LOGGING.debug("Opening connection")
         if self.is_alive():
             # someone else already created a new connection
             return self.connection
 
-        url = self._format_websocket_url(self.endpoint)
+        url = await self.format_websocket_url(self.endpoint)
 
         _LOGGING.debug("WS url %s", url)
         connect_kwargs: Dict[str, Any] = {}
@@ -73,21 +74,69 @@ class SamsungTVWSAsyncConnection(connection.SamsungTVWSBaseConnection):
         if event != MS_CHANNEL_CONNECT_EVENT:
             # Unexpected event received during connection routine
             await self.close()
-            if event == MS_CHANNEL_TIMEOUT:
-                _LOGGING.debug("connection not accepted on TV, or token missing/incorrect")
             raise exceptions.ConnectionFailure(response)
 
-        self._check_for_token(response)
+        await self.check_for_token(response)
 
         self.connection = connection
         return connection
+
+    async def format_websocket_url(self, app: str) -> str:
+        token = await self._get_token()
+        _LOGGING.debug("Token to send: %s", token)
+        params = {
+            "host": self.host,
+            "port": self.port,
+            "app": app,
+            "name": helper.serialize_string(self.name),
+            "token": token,
+        }
+
+        if self._is_ssl_connection():
+            return self._SSL_URL_FORMAT.format(**params)
+        else:
+            return self._URL_FORMAT.format(**params)
+
+    async def _get_token(self) -> Optional[str]:
+        _LOGGING.debug("Getting token from file: %s", self.token_file)
+        if self.token_file is not None:
+            try:
+                async with aiofiles.open(self.token_file) as token_file:
+                    token = (await token_file.read()).strip()
+                    _LOGGING.debug("Token file content: %s", token)
+                    return token
+            except OSError:
+                _LOGGING.error("Failed to open token file: %s", self.token_file)
+                return None
+        else:
+            _LOGGING.warning("Token file is None, returning token: %s", self.token)
+            return self.token
+
+    async def set_token(self, token: str) -> None:
+        """Set token in memory or file asynchronously."""
+        _LOGGING.info("New token %s", token)
+        if self.token_file is not None:
+            _LOGGING.debug("Save token to file: %s", token)
+            async with aiofiles.open(self.token_file, "w") as token_file:
+                await token_file.write(token)
+        else:
+            self.token = token
+
+    async def check_for_token(self, response: Dict[str, Any]) -> None:
+        token = response.get("data", {}).get("token")
+        if token:
+            _LOGGING.debug("Got token %s", token)
+            await self.set_token(token)
 
     async def start_listening(
         self, callback: Optional[Callable[[str, Any], Optional[Awaitable[None]]]] = None
     ) -> None:
         """Open, and start listening."""
+        _LOGGING.debug("Starting listening")
         if not self._recv_loop:
+            _LOGGING.debug("Not already listening, opening connection")
             if not self.is_alive():
+                _LOGGING.debug("Connection not alive, opening connection")
                 self.connection = await self.open()
 
             self._recv_loop = asyncio.ensure_future(
