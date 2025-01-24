@@ -1,103 +1,56 @@
 import logging
-from typing import Any
-
-import homeassistant.helpers.config_validation as cv
-import voluptuous as vol
-from homeassistant.components.switch import (ENTITY_ID_FORMAT, PLATFORM_SCHEMA,
-                                             SwitchEntity)
-from homeassistant.const import (CONF_NAME, CONF_RESOURCE, CONF_SWITCHES,
-                                 CONF_TIMEOUT)
+from typing import List
+from functools import partial
+from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
-from samsungtvws import SamsungTVWS
+from homeassistant.config_entries import ConfigEntry
+
+from . import FrameArtHub
+from .const import DOMAIN, CONF_HOST
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT = 5.0
-
-SWITCH_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_RESOURCE): cv.string,
-        vol.Optional(CONF_NAME): cv.string,
-        vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): vol.Coerce(float),
-    }
-)
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {vol.Required(CONF_SWITCHES): cv.schema_with_slug_keys(SWITCH_SCHEMA)}
-)
-
-def setup_platform(
-    hass: HomeAssistant,
-    config: ConfigType,
-    add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
+async def async_setup_entry(
+    hass: HomeAssistant, entry: ConfigEntry, async_add_entities
 ) -> None:
-    """Find and return art mode switches for Samsung The Frame TVs."""
-    devices: dict[str, Any] = config[CONF_SWITCHES]
-    switches = []
+    """Set up the switches for Frame Art integration from a config entry."""
+    _LOGGER.info("Setting up Frame Art switches for entry: %s", entry.data[CONF_HOST])
 
-    for object_id, device_config in devices.items():
+    # Retrieve the hub for this config entry
+    hub: FrameArtHub = hass.data[DOMAIN][entry.entry_id]
 
-        switches.append(
-            ArtSwitch(
-                object_id,
-                device_config[CONF_RESOURCE],
-                device_config.get(CONF_NAME, object_id),
-                device_config[CONF_TIMEOUT],
-            )
-        )
-
-    if not switches:
-        _LOGGER.error("No switches added")
-        return
-
-    add_entities(switches)
+    # Create and add the switch entity
+    switches = [ArtSwitch(hub)]
+    async_add_entities(switches)
 
 
 class ArtSwitch(SwitchEntity):
-    def __init__(
-        self,
-        object_id: str,
-        resource: str,
-        friendly_name: str,
-        timeout: float,
-    ) -> None:
+    """Representation of an art mode switch."""
+
+    def __init__(self, hub: FrameArtHub) -> None:
         """Initialize the switch."""
-        self.entity_id = ENTITY_ID_FORMAT.format(object_id)
-        self._resource = resource
-        self._attr_name = friendly_name
+        self._hub = hub
+        self._attr_name = f"{hub.name} Art Mode"
+        self._attr_unique_id = f"{hub.host}_art_mode".replace(".", "_")
         self._attr_is_on = False
-        self._timeout = timeout
-        self._tv = SamsungTVWS(self._resource, timeout=self._timeout)
 
-    def turn_on(self, **kwargs):
+    async def async_turn_on(self, **kwargs):
         """Turn the switch on."""
-        try:
-            self._tv.art().set_artmode('on')
-            self._attr_is_on = True
-            self._attr_available = True
-        except:
-            self._attr_available = False
+        _LOGGER.debug("Turning on art mode for %s", self._hub.name)
+        await self._hub.ex(partial(self._hub._tv.set_artmode, "on"))
+        self._attr_is_on = True
+        self.async_write_ha_state()
 
-    def turn_off(self, **kwargs):
+    async def async_turn_off(self, **kwargs):
         """Turn the switch off."""
-        try:
-            self._tv.art().set_artmode('off')
-            self._attr_is_on = False
-            self._attr_available = True
-        except:
-            self._attr_available = False
+        _LOGGER.debug("Turning off art mode for %s", self._hub.name)
+        await self._hub.ex(partial(self._hub._tv.set_artmode, "off"))
+        self._attr_is_on = False
+        self.async_write_ha_state()
 
-    def update(self):
-        """Update the switch status."""
-        try:
-            info = self._tv.art().get_artmode()
-            if info == 'on':
-                self._attr_is_on = True
-            else:
-                self._attr_is_on = False
-            self._attr_available = True
-        except:
-            self._attr_available = False
+    async def async_update(self):
+        """Update the switch state."""
+        _LOGGER.debug("Updating art mode status for %s", self._hub.name)
+        status = await self._hub.ex(self._hub._tv.get_artmode)
+        self._attr_is_on = status == "on"
