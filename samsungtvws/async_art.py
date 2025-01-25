@@ -411,9 +411,7 @@ class SamsungTVAsyncArt(SamsungTVWSAsyncConnection):
         return data
 
     async def get_brightness(self):
-        data = await self._send_art_request({"request": "get_brightness"})
-        if not data:
-            data = await self.get_artmode_settings("brightness")
+        data = await self.get_artmode_settings("brightness")
         assert data
         return data
 
